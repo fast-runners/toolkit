@@ -36,6 +36,7 @@ import {
 } from './requestUtils.js'
 import {getCacheServiceURL} from './config.js'
 import {getUserAgentString} from './shared/user-agent.js'
+import { CacheFormat } from './constants.js'
 
 function getCacheApiUrl(resource: string): string {
   const baseUrl: string = getCacheServiceURL()
@@ -81,6 +82,7 @@ export async function getCacheEntry(
   const httpClient = createHttpClient()
   const version = utils.getCacheVersion(
     paths,
+    CacheFormat.Default,
     options?.compressionMethod,
     options?.enableCrossOsArchive
   )
@@ -183,6 +185,7 @@ export async function reserveCache(
   const httpClient = createHttpClient()
   const version = utils.getCacheVersion(
     paths,
+    CacheFormat.Default,
     options?.compressionMethod,
     options?.enableCrossOsArchive
   )
