@@ -13,6 +13,7 @@ import {
   GetCacheEntryDownloadURLRequest
 } from './generated/results/api/v1/cache.js'
 import {HttpClientError} from '@actions/http-client'
+import { CacheFormat } from './internal/constants.js'
 
 export type {DownloadOptions, UploadOptions}
 export class ValidationError extends Error {
@@ -89,6 +90,7 @@ export function isFeatureAvailable(): boolean {
  * @param restoreKeys an optional ordered list of keys to use for restoring the cache if no cache hit occurred for primaryKey
  * @param downloadOptions cache download options
  * @param enableCrossOsArchive an optional boolean enabled to restore on windows any cache created on any platform
+ * @param format an optional parameter specifying for the format of the file to be saved into cache
  * @returns string returns the key for the cache hit, otherwise returns undefined
  */
 export async function restoreCache(
@@ -96,7 +98,8 @@ export async function restoreCache(
   primaryKey: string,
   restoreKeys?: string[],
   options?: DownloadOptions,
-  enableCrossOsArchive = false
+  enableCrossOsArchive = false,
+  format: CacheFormat = CacheFormat.Default
 ): Promise<string | undefined> {
   const cacheServiceVersion: string = getCacheServiceVersion()
   core.debug(`Cache service version: ${cacheServiceVersion}`)
@@ -110,7 +113,8 @@ export async function restoreCache(
         primaryKey,
         restoreKeys,
         options,
-        enableCrossOsArchive
+        enableCrossOsArchive,
+        format
       )
     case 'v1':
     default:
@@ -239,6 +243,7 @@ async function restoreCacheV1(
  * @param restoreKeys an optional ordered list of keys to use for restoring the cache if no cache hit occurred for primaryKey
  * @param downloadOptions cache download options
  * @param enableCrossOsArchive an optional boolean enabled to restore on windows any cache created on any platform
+ * @param format an optional parameter specifying for the format of the file to be saved into cache
  * @returns string returns the key for the cache hit, otherwise returns undefined
  */
 async function restoreCacheV2(
@@ -246,7 +251,8 @@ async function restoreCacheV2(
   primaryKey: string,
   restoreKeys?: string[],
   options?: DownloadOptions,
-  enableCrossOsArchive = false
+  enableCrossOsArchive = false,
+  format: CacheFormat = CacheFormat.Default,
 ): Promise<string | undefined> {
   // Override UploadOptions to force the use of Azure
   options = {
@@ -278,6 +284,7 @@ async function restoreCacheV2(
       restoreKeys,
       version: utils.getCacheVersion(
         paths,
+        format,
         compressionMethod,
         enableCrossOsArchive
       )
@@ -326,11 +333,26 @@ async function restoreCacheV2(
       )} MB (${archiveFileSize} B)`
     )
 
-    if (core.isDebug()) {
-      await listTar(archivePath, compressionMethod)
+    switch(format) {
+      case CacheFormat.SquashFS:
+      case CacheFormat.EROFS:
+        if (core.isDebug()) {
+          await utils.listImage(archivePath, format)
+        }
+
+        await utils.mountImage(archivePath, format)
+        // This prevents archive from being deleted
+        archivePath = ''
+        break
+
+      default:
+        if (core.isDebug()) {
+          await listTar(archivePath, compressionMethod)
+        }
+
+        await extractTar(archivePath, compressionMethod)
     }
 
-    await extractTar(archivePath, compressionMethod)
     core.info('Cache restored successfully')
 
     return response.matchedKey
@@ -370,6 +392,7 @@ async function restoreCacheV2(
  * @param paths a list of file paths to be cached
  * @param key an explicit key for restoring the cache
  * @param enableCrossOsArchive an optional boolean enabled to save cache on windows which could be restored on any platform
+ * @param format an optional parameter specifying for the format of the file to be saved into cache
  * @param options cache upload options
  * @returns number returns cacheId if the cache was saved successfully and throws an error if save fails
  */
@@ -377,7 +400,8 @@ export async function saveCache(
   paths: string[],
   key: string,
   options?: UploadOptions,
-  enableCrossOsArchive = false
+  enableCrossOsArchive = false,
+  format: CacheFormat = CacheFormat.Default,
 ): Promise<number> {
   const cacheServiceVersion: string = getCacheServiceVersion()
   core.debug(`Cache service version: ${cacheServiceVersion}`)
@@ -385,7 +409,7 @@ export async function saveCache(
   checkKey(key)
   switch (cacheServiceVersion) {
     case 'v2':
-      return await saveCacheV2(paths, key, options, enableCrossOsArchive)
+      return await saveCacheV2(paths, key, options, enableCrossOsArchive, format)
     case 'v1':
     default:
       return await saveCacheV1(paths, key, options, enableCrossOsArchive)
@@ -511,13 +535,15 @@ async function saveCacheV1(
  * @param key an explicit key for restoring the cache
  * @param options cache upload options
  * @param enableCrossOsArchive an optional boolean enabled to save cache on windows which could be restored on any platform
+ * @param format an optional parameter specifying for the format of the file to be saved into cache
  * @returns
  */
 async function saveCacheV2(
   paths: string[],
   key: string,
   options?: UploadOptions,
-  enableCrossOsArchive = false
+  enableCrossOsArchive = false,
+  format: CacheFormat = CacheFormat.Default,
 ): Promise<number> {
   // Override UploadOptions to force the use of Azure
   // ...options goes first because we want to override the default values
@@ -528,7 +554,7 @@ async function saveCacheV2(
     uploadConcurrency: 8, // 8 workers for parallel upload
     useAzureSdk: true
   }
-  const compressionMethod = await utils.getCompressionMethod()
+  let compressionMethod = await utils.getCompressionMethod(format);
   const twirpClient = cacheTwirpClient.internalCacheTwirpClient()
   let cacheId = -1
 
@@ -543,7 +569,7 @@ async function saveCacheV2(
   }
 
   const archiveFolder = await utils.createTempDirectory()
-  const archivePath = path.join(
+  let archivePath = path.join(
     archiveFolder,
     utils.getCacheFileName(compressionMethod)
   )
@@ -556,6 +582,29 @@ async function saveCacheV2(
       await listTar(archivePath, compressionMethod)
     }
 
+    switch (format) {
+      case CacheFormat.SquashFS:
+        core.debug(`Building SquashFS image from ${archivePath}`)
+        {
+          let imagePath = await utils.tar2SquashFS(archivePath)
+          try { await utils.unlinkFile(archivePath) } catch {}
+          archivePath = imagePath
+        }
+        break
+        
+      case CacheFormat.EROFS:
+        core.debug(`Building EROFS image from ${archivePath}`)
+        {
+          let imagePath = await utils.tar2EROFS(archivePath)
+          try { await utils.unlinkFile(archivePath) } catch {}
+          archivePath = imagePath
+        }
+        break
+      
+      default:
+        // do nothing
+    }
+
     const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath)
     core.debug(`File Size: ${archiveFileSize}`)
 
@@ -565,6 +614,7 @@ async function saveCacheV2(
     core.debug('Reserving Cache')
     const version = utils.getCacheVersion(
       paths,
+      format,
       compressionMethod,
       enableCrossOsArchive
     )

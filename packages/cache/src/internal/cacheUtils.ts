@@ -9,11 +9,16 @@ import * as semver from 'semver'
 import * as util from 'util'
 import {
   CacheFilename,
+  CacheFormat,
   CompressionMethod,
   GnuTarPathOnWindows
 } from './constants.js'
 
 const versionSalt = '1.0'
+
+export function getWorkingDirectory(): string {
+  return process.env['GITHUB_WORKSPACE'] ?? process.cwd()
+}
 
 // From https://github.com/actions/toolkit/blob/main/packages/tool-cache/src/tool-cache.ts#L23
 export async function createTempDirectory(): Promise<string> {
@@ -47,7 +52,7 @@ export function getArchiveFileSizeInBytes(filePath: string): number {
 
 export async function resolvePaths(patterns: string[]): Promise<string[]> {
   const paths: string[] = []
-  const workspace = process.env['GITHUB_WORKSPACE'] ?? process.cwd()
+  const workspace = getWorkingDirectory()
   const globber = await glob.create(patterns.join('\n'), {
     implicitDescendants: false
   })
@@ -99,15 +104,22 @@ async function getVersion(
 }
 
 // Use zstandard if possible to maximize cache performance
-export async function getCompressionMethod(): Promise<CompressionMethod> {
-  const versionOutput = await getVersion('zstd', ['--quiet'])
-  const version = semver.clean(versionOutput)
-  core.debug(`zstd version: ${version}`)
+export async function getCompressionMethod(format?: CacheFormat): Promise<CompressionMethod> {
+  switch(format) {
+    case CacheFormat.SquashFS:
+    case CacheFormat.EROFS:
+      return CompressionMethod.Gzip
 
-  if (versionOutput === '') {
-    return CompressionMethod.Gzip
-  } else {
-    return CompressionMethod.ZstdWithoutLong
+    default:
+      const versionOutput = await getVersion('zstd', ['--quiet'])
+      const version = semver.clean(versionOutput)
+      core.debug(`zstd version: ${version}`)
+
+      if (versionOutput === '') {
+        return CompressionMethod.Gzip
+      } else {
+        return CompressionMethod.ZstdWithoutLong
+      }
   }
 }
 
@@ -135,11 +147,16 @@ export function assertDefined<T>(name: string, value?: T): T {
 
 export function getCacheVersion(
   paths: string[],
+  format: CacheFormat,
   compressionMethod?: CompressionMethod,
   enableCrossOsArchive = false
 ): string {
   // don't pass changes upstream
   const components = paths.slice()
+
+  if (format != CacheFormat.Default) {
+    components.push(format)
+  }
 
   // Add compression method to cache version to restore
   // compressed cache as per compression method
@@ -164,4 +181,75 @@ export function getRuntimeToken(): string {
     throw new Error('Unable to get the ACTIONS_RUNTIME_TOKEN env variable')
   }
   return token
+}
+
+function changeExtension(filePath: string, newExt: string): string {
+  const ext = newExt.startsWith(".") ? newExt : `.${newExt}`
+  const { dir, name } = path.parse(filePath)
+  return path.join(dir, `${name}${ext}`)
+}
+
+export async function tar2SquashFS(archivePath: string): Promise<string> {
+  const imagePath = changeExtension(archivePath, CacheFormat.SquashFS)
+  // We might consider using lz4 for the parity with EROFS
+  await exec.exec(`zcat ${archivePath} | sqfstar -comp zstd -b 1M ${imagePath}`)
+  return imagePath
+}
+
+export async function tar2EROFS(archivePath: string): Promise<string> {
+  const imagePath = changeExtension(archivePath, CacheFormat.EROFS)
+  // Ubuntu24 images have mkfs.erofs compiled without zstd support hence lz4 
+  await exec.exec(`mkfs.erofs -z lz4 --tar=f --gzip ${imagePath} ${archivePath}`)
+  return imagePath
+}
+
+export async function mountImage(archivePath: string, format: CacheFormat) : Promise<void> {
+  const parentDir = await createTempDirectory()
+  // Workspace dir is bind mounted here
+  const localDir = path.join(parentDir, "local")
+  // Cache is mounted here
+  const cacheDir = path.join(parentDir, "cache")
+  // Writable dir for the overlay upper layer
+  const writeDir = path.join(parentDir, "write")
+  // Work directory for the OverlayFS
+  const workDir = path.join(parentDir, "work")
+  // Merged OverlayFS directory
+  const mergeDir = path.join(parentDir, "merge")
+
+  await io.mkdirP(localDir)
+  await io.mkdirP(cacheDir)
+  await io.mkdirP(writeDir)
+  await io.mkdirP(workDir)
+  await io.mkdirP(mergeDir)
+
+  const workspaceDir = getWorkingDirectory()
+
+  core.debug(`Mounting workspace to ${localDir}`)
+  await exec.exec(`sudo mount --bind ${workspaceDir} ${localDir}`)
+  await exec.exec(`sudo mount -o remount,bind,ro ${localDir}`)
+
+  core.debug(`Mounting cache to ${cacheDir}`)
+  await exec.exec(`sudo mount -t ${format} -o loop,ro ${archivePath} ${cacheDir}`)
+
+  core.debug(`Mounting OverlayFS to ${mergeDir}`)
+  await exec.exec(`sudo mount -t overlay overlay -o lowerdir="${cacheDir}:${localDir}",upperdir=${writeDir},workdir=${workDir} ${mergeDir}`)
+
+  core.debug(`Mounting ${mergeDir} on top of workspace`)
+  await exec.exec(`sudo mount --bind ${mergeDir} "${workspaceDir}`)
+}
+
+export async function listImage(archivePath: string, format: CacheFormat) : Promise<void> {
+  switch(format) {
+    case CacheFormat.SquashFS:
+      await exec.exec(`unsquashfs -l ${archivePath}`)
+      break
+
+    case CacheFormat.EROFS:
+      // This is not a recursive print
+      await exec.exec(`dump.erofs --ls --path=/ ${archivePath}`)
+      break
+
+    default:
+      throw Error(`Unexpected format ${format}`)
+  }
 }

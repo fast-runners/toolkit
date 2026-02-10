@@ -1,3 +1,10 @@
+export enum CacheFormat {
+  Default = 'tar',
+  Tar = 'tar',
+  SquashFS = 'squashfs',
+  EROFS = 'erofs',
+}
+
 export enum CacheFilename {
   Gzip = 'cache.tgz',
   Zstd = 'cache.tzst'
