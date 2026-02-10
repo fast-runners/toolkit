@@ -204,7 +204,7 @@ export async function tar2EROFS(archivePath: string): Promise<string> {
 }
 
 export async function mountImage(archivePath: string, format: CacheFormat) : Promise<void> {
-  const parentDir = await createTempDirectory()
+  const parentDir = path.dirname(archivePath);
   // Workspace dir is bind mounted here
   const localDir = path.join(parentDir, "local")
   // Cache is mounted here

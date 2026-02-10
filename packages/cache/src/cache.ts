@@ -277,7 +277,7 @@ async function restoreCacheV2(
   let archivePath = ''
   try {
     const twirpClient = cacheTwirpClient.internalCacheTwirpClient()
-    const compressionMethod = await utils.getCompressionMethod()
+    const compressionMethod = await utils.getCompressionMethod(format)
 
     const request: GetCacheEntryDownloadURLRequest = {
       key: primaryKey,
@@ -673,6 +673,8 @@ async function saveCacheV2(
         `Unable to finalize cache with key ${key}, another job may be finalizing this cache.`
       )
     }
+
+    core.debug(`Cache saved with version ${version} for key ${key}`)
 
     cacheId = parseInt(finalizeResponse.entryId)
   } catch (error) {
