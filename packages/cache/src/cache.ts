@@ -13,7 +13,7 @@ import {
   GetCacheEntryDownloadURLRequest
 } from './generated/results/api/v1/cache.js'
 import {HttpClientError} from '@actions/http-client'
-import { CacheFormat } from './internal/constants.js'
+import { CacheFormat, toCacheFormat } from './internal/constants.js'
 
 export type {DownloadOptions, UploadOptions}
 export class ValidationError extends Error {
@@ -99,7 +99,7 @@ export async function restoreCache(
   restoreKeys?: string[],
   options?: DownloadOptions,
   enableCrossOsArchive = false,
-  format: CacheFormat = CacheFormat.Default
+  format?: string
 ): Promise<string | undefined> {
   const cacheServiceVersion: string = getCacheServiceVersion()
   core.debug(`Cache service version: ${cacheServiceVersion}`)
@@ -114,7 +114,7 @@ export async function restoreCache(
         restoreKeys,
         options,
         enableCrossOsArchive,
-        format
+        toCacheFormat(format)
       )
     case 'v1':
     default:
@@ -401,7 +401,7 @@ export async function saveCache(
   key: string,
   options?: UploadOptions,
   enableCrossOsArchive = false,
-  format: CacheFormat = CacheFormat.Default,
+  format?: string,
 ): Promise<number> {
   const cacheServiceVersion: string = getCacheServiceVersion()
   core.debug(`Cache service version: ${cacheServiceVersion}`)
@@ -409,7 +409,13 @@ export async function saveCache(
   checkKey(key)
   switch (cacheServiceVersion) {
     case 'v2':
-      return await saveCacheV2(paths, key, options, enableCrossOsArchive, format)
+      return await saveCacheV2(
+        paths,
+        key,
+        options,
+        enableCrossOsArchive,
+        toCacheFormat(format)
+      )
     case 'v1':
     default:
       return await saveCacheV1(paths, key, options, enableCrossOsArchive)

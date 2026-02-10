@@ -5,6 +5,15 @@ export enum CacheFormat {
   EROFS = 'erofs',
 }
 
+export function toCacheFormat(value?: string): CacheFormat {
+  if ((Object.values(CacheFormat) as readonly string[]).includes(value ?? '')) {
+    return value as CacheFormat
+  }
+  else {
+    return CacheFormat.Default
+  }
+}
+
 export enum CacheFilename {
   Gzip = 'cache.tgz',
   Zstd = 'cache.tzst'

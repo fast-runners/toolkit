@@ -192,7 +192,7 @@ function changeExtension(filePath: string, newExt: string): string {
 export async function tar2SquashFS(archivePath: string): Promise<string> {
   const imagePath = changeExtension(archivePath, CacheFormat.SquashFS)
   // We might consider using lz4 for the parity with EROFS
-  await exec.exec(`zcat ${archivePath} | sqfstar -comp zstd -b 1M ${imagePath}`)
+  await exec.exec(`sh -c "zcat ${archivePath} | sqfstar -comp zstd -b 1M ${imagePath}"`)
   return imagePath
 }
 

@@ -15,7 +15,8 @@
   "exports": {
     ".": {
       "types": "./lib/core.d.ts",
-      "import": "./lib/core.js"
+      "import": "./lib/core.js",
+      "require": "./lib/core.cjs"
     }
   },
   "directories": {

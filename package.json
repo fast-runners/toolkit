@@ -5,6 +5,7 @@
     "audit-all": "lerna run audit-moderate",
     "bootstrap": "lerna exec -- npm install",
     "build": "lerna run tsc",
+    "postbuild": "node ./scripts/generate-cache-cjs.mjs",
     "clean": "lerna clean",
     "repair": "lerna repair",
     "check-all": "concurrently \"npm:format-check\" \"npm:lint\" \"npm:test\" \"npm:build -- -- --noEmit\"",
