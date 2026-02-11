@@ -1,6 +1,6 @@
 {
   "name": "root",
-  "private": true, 
+  "private": true,
   "scripts": {
     "audit-all": "lerna run audit-moderate",
     "bootstrap": "lerna exec -- npm install",
@@ -47,5 +47,8 @@
     "form-data": "^4.0.4",
     "uri-js": "npm:uri-js-replace@^1.0.1",
     "node-fetch": "^3.3.2"
+  },
+  "dependencies": {
+    "@azure/identity": "^4.13.0"
   }
 }

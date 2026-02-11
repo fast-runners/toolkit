@@ -14,6 +14,8 @@ import {
 } from './generated/results/api/v1/cache.js'
 import {HttpClientError} from '@actions/http-client'
 import { CacheFormat, toCacheFormat } from './internal/constants.js'
+import { BlobServiceClient, generateBlobSASQueryParameters, BlobSASPermissions, SASProtocol } from '@azure/storage-blob'
+import { ClientAssertionCredential } from '@azure/identity'
 
 export type {DownloadOptions, UploadOptions}
 export class ValidationError extends Error {
@@ -38,6 +40,90 @@ export class FinalizeCacheError extends Error {
     this.name = 'FinalizeCacheError'
     Object.setPrototypeOf(this, FinalizeCacheError.prototype)
   }
+}
+
+async function uploadToAdditionalStorageAccounts(
+  cacheId: number,
+  archivePath: string,
+  fileName: string,
+  storageAccounts: string[],
+  options?: UploadOptions
+): Promise<void> {
+  const clientId: string = process.env.SPN_CLIENT_ID ?? ''
+  const tenantId: string = process.env.SPN_TENANT_ID ?? ''
+
+  const credential = new ClientAssertionCredential(
+    tenantId,
+    clientId,
+    async () => await core.getIDToken('api://AzureADTokenExchange')
+  );
+
+  const uploadPromises = storageAccounts.map(async (storageAccount) => {
+    try {
+      core.debug(`Generating SAS URL for storage account: ${storageAccount}`);
+
+      const sasUrl = await generateSasUrl(
+        storageAccount,
+        'actions-cache',
+        `${fileName}/${fileName}`,
+        credential
+      );
+
+      core.debug(`Uploading to additional storage account: ${storageAccount}`);  
+      await cacheHttpClient.saveCache(
+        cacheId,
+        archivePath,
+        sasUrl,
+        options
+      );
+
+      core.info(`Successfully uploaded cache to storage account: ${storageAccount}`);
+    } catch (error) {
+      core.info(`Upload failed: ${error}`)
+    }
+  });
+  
+  await Promise.allSettled(uploadPromises);
+}
+
+async function generateSasUrl(
+  accountName: string,
+  containerName: string,
+  blobName: string,
+  credential: ClientAssertionCredential
+): Promise<string> {
+  const blobServiceClient = new BlobServiceClient(
+    `https://${accountName}.blob.core.windows.net`,
+    credential
+  );
+  
+  // Get user delegation key
+  const startsOn = new Date(Date.now() - 5 * 60 * 1000); // 5 minutes ago to account for clock skew
+  const expiresOn = new Date(Date.now() + 60 * 60 * 1000); // 1 hour from now
+  
+  const userDelegationKey = await blobServiceClient.getUserDelegationKey(
+    startsOn,
+    expiresOn
+  );
+  
+  // Generate SAS query parameters
+  const sasQueryParameters = generateBlobSASQueryParameters(
+    {
+      containerName,
+      blobName,
+      permissions: BlobSASPermissions.parse('w'), // write permissions
+      startsOn,
+      expiresOn,
+      protocol: SASProtocol.Https
+    },
+    userDelegationKey,
+    accountName
+  );
+  
+  // Construct the full URL with SAS parameters
+  const sasUrl = `https://${accountName}.blob.core.windows.net/${containerName}/${blobName}?${sasQueryParameters.toString()}`;
+  
+  return sasUrl;
 }
 
 function checkPaths(paths: string[]): void {
@@ -654,6 +740,25 @@ async function saveCacheV2(
       signedUploadUrl,
       options
     )
+
+    // Upload to additional storage accounts if configured
+    const additionalStorageAccounts = process.env.ADDITIONAL_STORAGE_ACCOUNTS
+    if (additionalStorageAccounts) {
+      const storageAccountNames: string[] = additionalStorageAccounts.split(',')
+        
+      // Extract blob name from the signed upload URL
+      const urlPath = new URL(signedUploadUrl).pathname
+      const fileName = urlPath.split('/').pop() ?? ''
+                
+      core.debug(`Uploading '${fileName}' to '${additionalStorageAccounts}'`)
+      await uploadToAdditionalStorageAccounts(
+        cacheId,
+        archivePath,
+        fileName,
+        storageAccountNames,
+        options
+      )
+    }
 
     const finalizeRequest: FinalizeCacheEntryUploadRequest = {
       key,
