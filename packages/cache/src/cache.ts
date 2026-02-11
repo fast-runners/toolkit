@@ -49,15 +49,6 @@ async function uploadToAdditionalStorageAccounts(
   storageAccounts: string[],
   options?: UploadOptions
 ): Promise<void> {
-  const clientId: string = process.env.SPN_CLIENT_ID ?? ''
-  const tenantId: string = process.env.SPN_TENANT_ID ?? ''
-
-  const credential = new ClientAssertionCredential(
-    tenantId,
-    clientId,
-    async () => await core.getIDToken('api://AzureADTokenExchange')
-  );
-
   const uploadPromises = storageAccounts.map(async (storageAccount) => {
     try {
       core.debug(`Generating SAS URL for storage account: ${storageAccount}`);
@@ -65,8 +56,7 @@ async function uploadToAdditionalStorageAccounts(
       const sasUrl = await generateSasUrl(
         storageAccount,
         'actions-cache',
-        `${fileName}/${fileName}`,
-        credential
+        `${fileName}/${fileName}`
       );
 
       core.debug(`Uploading to additional storage account: ${storageAccount}`);  
@@ -90,8 +80,15 @@ async function generateSasUrl(
   accountName: string,
   containerName: string,
   blobName: string,
-  credential: ClientAssertionCredential
 ): Promise<string> {
+  const clientId: string = process.env.SPN_CLIENT_ID ?? '';
+  const tenantId: string = process.env.SPN_TENANT_ID ?? '';
+  const credential = new ClientAssertionCredential(
+    tenantId,
+    clientId,
+    async () => await core.getIDToken('api://AzureADTokenExchange')
+  );
+
   const blobServiceClient = new BlobServiceClient(
     `https://${accountName}.blob.core.windows.net`,
     credential
@@ -106,12 +103,11 @@ async function generateSasUrl(
     expiresOn
   );
   
-  // Generate SAS query parameters
   const sasQueryParameters = generateBlobSASQueryParameters(
     {
       containerName,
       blobName,
-      permissions: BlobSASPermissions.parse('w'), // write permissions
+      permissions: BlobSASPermissions.parse('rw'),
       startsOn,
       expiresOn,
       protocol: SASProtocol.Https
@@ -124,6 +120,70 @@ async function generateSasUrl(
   const sasUrl = `https://${accountName}.blob.core.windows.net/${containerName}/${blobName}?${sasQueryParameters.toString()}`;
   
   return sasUrl;
+}
+
+async function getAzureVmLocation(): Promise<string | undefined> {
+  try {
+    // Query Azure Instance Metadata Service (IMDS) to get VM compute metadata
+    const response = await fetch('http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01', {
+      headers: {
+        'Metadata': 'true'
+      },
+    });
+    
+    if (response.ok) {
+      const computeData = await response.json();
+      const location = computeData.location;
+      core.debug(`Azure VM location detected: ${location}`);
+      return location.toLowerCase();
+    }
+  } catch (error) {
+    core.debug(`Failed to query Azure IMDS: ${error}`);
+  }
+  return undefined;
+}
+
+async function getAdditionalDownloadUrl(
+  originalUrl: string,
+): Promise<string | undefined> {
+  const vmLocation = await getAzureVmLocation();
+  if (!vmLocation) {
+    core.debug('VM location not detected');
+    return undefined;
+  }
+
+  // Find storage account that ends with VM location (pick shortest prefix after stripping location suffix)
+  // This is to handle cases where we have foocentralus, foonorthcentralus and foosouthcentralus
+  const additionalStorageAccounts = process.env.ADDITIONAL_STORAGE_ACCOUNTS ?? '';
+  let selectedStorageAccount: string | undefined;
+  let shortestPrefixLength = Infinity;
+  
+  const storageAccountNames: string[] = additionalStorageAccounts.split(',');
+  for (const storageAccount of storageAccountNames) {
+    if (storageAccount.endsWith(vmLocation)) {
+      const prefix = storageAccount.slice(0, -vmLocation.length);
+      if (prefix.length < shortestPrefixLength) {
+        shortestPrefixLength = prefix.length;
+        selectedStorageAccount = storageAccount;
+      }
+    }
+  }
+
+  if (!selectedStorageAccount) {
+    core.debug(`No storage account found in ${vmLocation}`);
+    return undefined;
+  }
+
+  core.debug(`Using storage account: ${selectedStorageAccount}`);
+
+  // Extract blob name from original URL
+  const urlPath = new URL(originalUrl).pathname;
+  const fileName = urlPath.split('/').pop() ?? '';
+  return await generateSasUrl(
+      selectedStorageAccount,
+      'actions-cache',
+      `${fileName}/${fileName}`
+    );      
 }
 
 function checkPaths(paths: string[]): void {
@@ -406,11 +466,24 @@ async function restoreCacheV2(
     core.debug(`Archive path: ${archivePath}`)
     core.debug(`Starting download of archive to: ${archivePath}`)
 
+    let downloadUrl: string | undefined
+
+    switch(format) {
+      case CacheFormat.SquashFS:
+      case CacheFormat.EROFS:
+        downloadUrl = await getAdditionalDownloadUrl(response.signedDownloadUrl)
+        break
+
+      default:
+        downloadUrl = response.signedDownloadUrl
+    }
+
+    core.debug(`Downloading from ${downloadUrl}`);
     await cacheHttpClient.downloadCache(
-      response.signedDownloadUrl,
+      downloadUrl ?? '',
       archivePath,
       options
-    )
+    );
 
     const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath)
     core.info(
