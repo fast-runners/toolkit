@@ -211,13 +211,15 @@ export async function tar2EROFS(archivePath: string): Promise<string> {
   return imagePath
 }
 
-export async function mountImage(archivePath: string, format: CacheFormat, blobfuseConfig: string) : Promise<void> {
-  const parentDir = path.dirname(archivePath);
+export async function mountImage(archiveName: string, format: CacheFormat, blobfuseConfig: string) : Promise<string> {
+  const parentDir = await createTempDirectory()
 
   // Workspace dir is bind mounted here
   const localDir = path.join(parentDir, "local")
-  // Blobfuse2 block cache
-  const blockDir = path.join(parentDir, "block_cache")
+  // Blobfuse2 mount point
+  const fuseDir = path.join(parentDir, "fuse")
+  // Blobfuse2 file cache
+  const tmpDir = path.join(parentDir, "block")
   // Cache is mounted here
   const cacheDir = path.join(parentDir, "cache")
   // Writable dir for the overlay upper layer
@@ -228,23 +230,26 @@ export async function mountImage(archivePath: string, format: CacheFormat, blobf
   const mergeDir = path.join(parentDir, "merge")
 
   await io.mkdirP(localDir)
+  await io.mkdirP(fuseDir)
+  await io.mkdirP(tmpDir)
   await io.mkdirP(cacheDir)
   await io.mkdirP(writeDir)
   await io.mkdirP(workDir)
   await io.mkdirP(mergeDir)
-  await io.mkdirP(blockDir)
 
   const workspaceDir = getWorkingDirectory()
-  const configFile = path.join(parentDir, 'config.yml')
 
+  core.debug(`Mounting blobfuse to ${fuseDir}`)
+  const configFile = path.join(parentDir, 'config.yml')
   fs.writeFileSync(configFile, blobfuseConfig);
-  fs.writeFileSync(path.join(parentDir, 'mount.sh'), `blobfuse2 mount ${cacheDir} --read-only --block-cache --block-cache-path ${blockDir} --config-file ${configFile}`)
+  await exec.exec(`sudo blobfuse2 mount ${fuseDir} --read-only --block-cache --block-cache-path ${tmpDir} --config-file ${configFile} --streaming`)
 
   core.debug(`Mounting workspace to ${localDir}`)
   await exec.exec(`sudo mount --bind ${workspaceDir} ${localDir}`)
   await exec.exec(`sudo mount -o remount,bind,ro ${localDir}`)
 
   core.debug(`Mounting cache to ${cacheDir}`)
+  const archivePath = path.join(fuseDir, archiveName)
   await exec.exec(`sudo mount -t ${format} -o loop,ro ${archivePath} ${cacheDir}`)
 
   core.debug(`Mounting OverlayFS to ${mergeDir}`)
@@ -252,6 +257,8 @@ export async function mountImage(archivePath: string, format: CacheFormat, blobf
 
   core.debug(`Mounting ${mergeDir} on top of workspace`)
   await exec.exec(`sudo mount --bind ${mergeDir} "${workspaceDir}`)
+
+  return cacheDir
 }
 
 export async function listImage(archivePath: string, format: CacheFormat) : Promise<void> {

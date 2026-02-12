@@ -16,6 +16,7 @@ import {HttpClientError} from '@actions/http-client'
 import { CacheFormat, toCacheFormat } from './internal/constants.js'
 import { BlobServiceClient, generateBlobSASQueryParameters, BlobSASPermissions, SASProtocol } from '@azure/storage-blob'
 import { ClientAssertionCredential } from '@azure/identity'
+import * as exec from '@actions/exec'
 
 export type {DownloadOptions, UploadOptions}
 export class ValidationError extends Error {
@@ -394,40 +395,39 @@ async function restoreCacheV2(
       return response.matchedKey
     }
 
-    archivePath = path.join(
-      await utils.createTempDirectory(),
-      utils.getCacheFileName(compressionMethod)
-    )
-    core.debug(`Archive path: ${archivePath}`)
-    core.debug(`Starting download of archive to: ${archivePath}`)
-
-    await cacheHttpClient.downloadCache(
-      response.signedDownloadUrl,
-      archivePath,
-      options
-    );
-
-    const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath)
-    core.info(
-      `Cache Size: ~${Math.round(
-        archiveFileSize / (1024 * 1024)
-      )} MB (${archiveFileSize} B)`
-    )
-
     switch(format) {
       case CacheFormat.SquashFS:
       case CacheFormat.EROFS:
-        if (core.isDebug()) {
-          await utils.listImage(archivePath, format)
-        }
-
+        const urlPath = new URL(response.signedDownloadUrl).pathname;
+        const fileName = urlPath.split('/').pop() ?? '';
         const blobfuseConfig = await utils.generateBlobfuse2Config(response.signedDownloadUrl)
-        await utils.mountImage(archivePath, format, blobfuseConfig)
-        // This prevents archive from being deleted
-        archivePath = ''
+        const cacheDir = await utils.mountImage(fileName, format, blobfuseConfig)
+        if (core.isDebug()) {
+          await exec.exec(`find ${cacheDir}`)
+        }
         break
 
       default:
+        archivePath = path.join(
+          await utils.createTempDirectory(),
+          utils.getCacheFileName(compressionMethod)
+        )
+        core.debug(`Archive path: ${archivePath}`)
+        core.debug(`Starting download of archive to: ${archivePath}`)
+
+        await cacheHttpClient.downloadCache(
+          response.signedDownloadUrl,
+          archivePath,
+          options
+        );
+
+        const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath)
+        core.info(
+          `Cache Size: ~${Math.round(
+            archiveFileSize / (1024 * 1024)
+          )} MB (${archiveFileSize} B)`
+        )
+
         if (core.isDebug()) {
           await listTar(archivePath, compressionMethod)
         }
