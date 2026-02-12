@@ -53,11 +53,12 @@ async function uploadToAdditionalStorageAccounts(
     try {
       core.debug(`Generating SAS URL for storage account: ${storageAccount}`);
 
-      const sasUrl = await generateSasUrl(
+      const sas = await generateSas(
         storageAccount,
         'actions-cache',
         `${fileName}/${fileName}`
       );
+      const sasUrl = `https://${storageAccount}.blob.core.windows.net/actions-cache/${fileName}/${fileName}?${sas}`;
 
       core.debug(`Uploading to additional storage account: ${storageAccount}`);  
       await cacheHttpClient.saveCache(
@@ -76,10 +77,10 @@ async function uploadToAdditionalStorageAccounts(
   await Promise.allSettled(uploadPromises);
 }
 
-async function generateSasUrl(
+async function generateSas(
   accountName: string,
   containerName: string,
-  blobName: string,
+  blobName?: string,
 ): Promise<string> {
   const clientId: string = process.env.SPN_CLIENT_ID ?? '';
   const tenantId: string = process.env.SPN_TENANT_ID ?? '';
@@ -96,7 +97,7 @@ async function generateSasUrl(
   
   // Get user delegation key
   const startsOn = new Date(Date.now() - 5 * 60 * 1000); // 5 minutes ago to account for clock skew
-  const expiresOn = new Date(Date.now() + 60 * 60 * 1000); // 1 hour from now
+  const expiresOn = new Date(Date.now() + 6 * 60 * 60 * 1000); // 6 hours from now
   
   const userDelegationKey = await blobServiceClient.getUserDelegationKey(
     startsOn,
@@ -116,74 +117,8 @@ async function generateSasUrl(
     accountName
   );
   
-  // Construct the full URL with SAS parameters
-  const sasUrl = `https://${accountName}.blob.core.windows.net/${containerName}/${blobName}?${sasQueryParameters.toString()}`;
   
-  return sasUrl;
-}
-
-async function getAzureVmLocation(): Promise<string | undefined> {
-  try {
-    // Query Azure Instance Metadata Service (IMDS) to get VM compute metadata
-    const response = await fetch('http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01', {
-      headers: {
-        'Metadata': 'true'
-      },
-    });
-    
-    if (response.ok) {
-      const computeData = await response.json();
-      const location = computeData.location;
-      core.debug(`Azure VM location detected: ${location}`);
-      return location.toLowerCase();
-    }
-  } catch (error) {
-    core.debug(`Failed to query Azure IMDS: ${error}`);
-  }
-  return undefined;
-}
-
-async function getAdditionalDownloadUrl(
-  originalUrl: string,
-): Promise<string | undefined> {
-  const vmLocation = await getAzureVmLocation();
-  if (!vmLocation) {
-    core.debug('VM location not detected');
-    return undefined;
-  }
-
-  // Find storage account that ends with VM location (pick shortest prefix after stripping location suffix)
-  // This is to handle cases where we have foocentralus, foonorthcentralus and foosouthcentralus
-  const additionalStorageAccounts = process.env.ADDITIONAL_STORAGE_ACCOUNTS ?? '';
-  let selectedStorageAccount: string | undefined;
-  let shortestPrefixLength = Infinity;
-  
-  const storageAccountNames: string[] = additionalStorageAccounts.split(',');
-  for (const storageAccount of storageAccountNames) {
-    if (storageAccount.endsWith(vmLocation)) {
-      const prefix = storageAccount.slice(0, -vmLocation.length);
-      if (prefix.length < shortestPrefixLength) {
-        shortestPrefixLength = prefix.length;
-        selectedStorageAccount = storageAccount;
-      }
-    }
-  }
-
-  if (!selectedStorageAccount) {
-    core.debug(`No storage account found in ${vmLocation}`);
-    return undefined;
-  }
-
-  core.debug(`Using storage account: ${selectedStorageAccount}`);
-
-  // Extract blob name from original URL
-  const urlPath = new URL(originalUrl).pathname;
-  const fileName = urlPath.split('/').pop() ?? '';
-  return await generateSasUrl(
-      selectedStorageAccount,
-      'actions-cache',
-      `${fileName}/${fileName}`
-    );      
+  return sasQueryParameters.toString();
 }
 
 function checkPaths(paths: string[]): void {
@@ -466,21 +401,8 @@ async function restoreCacheV2(
     core.debug(`Archive path: ${archivePath}`)
     core.debug(`Starting download of archive to: ${archivePath}`)
 
-    let downloadUrl: string | undefined
-
-    switch(format) {
-      case CacheFormat.SquashFS:
-      case CacheFormat.EROFS:
-        downloadUrl = await getAdditionalDownloadUrl(response.signedDownloadUrl)
-        break
-
-      default:
-        downloadUrl = response.signedDownloadUrl
-    }
-
-    core.debug(`Downloading from ${downloadUrl}`);
     await cacheHttpClient.downloadCache(
-      downloadUrl ?? '',
+      response.signedDownloadUrl,
       archivePath,
       options
     );
@@ -499,7 +421,8 @@ async function restoreCacheV2(
           await utils.listImage(archivePath, format)
         }
 
-        await utils.mountImage(archivePath, format)
+        const blobfuseConfig = await utils.generateBlobfuse2Config(response.signedDownloadUrl)
+        await utils.mountImage(archivePath, format, blobfuseConfig)
         // This prevents archive from being deleted
         archivePath = ''
         break

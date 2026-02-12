@@ -13,6 +13,14 @@ import {
   CompressionMethod,
   GnuTarPathOnWindows
 } from './constants.js'
+import {
+  DataLakeServiceClient,
+  generateDataLakeSASQueryParameters,
+  FileSystemSASPermissions,
+  SASProtocol
+} from "@azure/storage-file-datalake";
+import YAML from 'yaml';
+import { ClientAssertionCredential } from '@azure/identity'
 
 const versionSalt = '1.0'
 
@@ -203,10 +211,13 @@ export async function tar2EROFS(archivePath: string): Promise<string> {
   return imagePath
 }
 
-export async function mountImage(archivePath: string, format: CacheFormat) : Promise<void> {
+export async function mountImage(archivePath: string, format: CacheFormat, blobfuseConfig: string) : Promise<void> {
   const parentDir = path.dirname(archivePath);
+
   // Workspace dir is bind mounted here
   const localDir = path.join(parentDir, "local")
+  // Blobfuse2 block cache
+  const blockDir = path.join(parentDir, "block_cache")
   // Cache is mounted here
   const cacheDir = path.join(parentDir, "cache")
   // Writable dir for the overlay upper layer
@@ -221,8 +232,13 @@ export async function mountImage(archivePath: string, format: CacheFormat) : Pro
   await io.mkdirP(writeDir)
   await io.mkdirP(workDir)
   await io.mkdirP(mergeDir)
+  await io.mkdirP(blockDir)
 
   const workspaceDir = getWorkingDirectory()
+  const configFile = path.join(parentDir, 'config.yml')
+
+  fs.writeFileSync(configFile, blobfuseConfig);
+  fs.writeFileSync(path.join(parentDir, 'mount.sh'), `blobfuse2 mount ${cacheDir} --read-only --block-cache --block-cache-path ${blockDir} --config-file ${configFile}`)
 
   core.debug(`Mounting workspace to ${localDir}`)
   await exec.exec(`sudo mount --bind ${workspaceDir} ${localDir}`)
@@ -252,4 +268,162 @@ export async function listImage(archivePath: string, format: CacheFormat) : Prom
     default:
       throw Error(`Unexpected format ${format}`)
   }
+}
+
+interface BlobUrlParts {
+  accountName: string;
+  containerName: string;
+  blobDir: string;
+  sasToken: string;
+}
+
+function parseBlobUrlWithSas(url: string): BlobUrlParts {
+  const urlObj = new URL(url);
+  
+  const accountName = urlObj.hostname.split('.')[0];
+  const pathParts = urlObj.pathname.split('/').filter(part => part.length > 0);
+  const containerName = pathParts[0] || '';
+  const blobDir = pathParts.slice(1, -1).join('/');
+  const sasToken = urlObj.search;
+  
+  return {
+    accountName,
+    containerName,
+    blobDir,
+    sasToken
+  };
+}
+
+export async function generateBlobfuse2Config(blobUrl: string): Promise<string> {
+  const { accountName, containerName, blobDir, sasToken } = await getBlobMountParts(blobUrl);
+    
+  const config = {
+    block_cache: {
+      'prefetch-on-open': true,
+      'disk-timeout-sec': 21600 
+    },
+    azstorage: {
+      'type': 'adls',
+      'account-name': accountName,
+      'container': containerName,
+      'mode': 'sas',
+      'subdirectory': blobDir,
+      'sas': sasToken
+    }
+  };
+  
+  return YAML.stringify(config);
+}
+
+export async function generateDataLakeSas(
+  accountName: string,
+  containerName: string,
+  directoryPath?: string,
+): Promise<string> {
+  const clientId: string = process.env.SPN_CLIENT_ID ?? '';
+  const tenantId: string = process.env.SPN_TENANT_ID ?? '';
+  const credential = new ClientAssertionCredential(
+    tenantId,
+    clientId,
+    async () => await core.getIDToken('api://AzureADTokenExchange')
+  );
+
+  const datalakeServiceClient = new DataLakeServiceClient(
+    `https://${accountName}.dfs.core.windows.net`,
+    credential
+  );
+  
+  // Get user delegation key
+  const startsOn = new Date(Date.now() - 5 * 60 * 1000); // 5 minutes ago to account for clock skew
+  const expiresOn = new Date(Date.now() + 6 * 60 * 60 * 1000); // 6 hours from now
+  
+  const userDelegationKey = await datalakeServiceClient.getUserDelegationKey(
+    startsOn,
+    expiresOn
+  );
+  
+  const sasQueryParameters = generateDataLakeSASQueryParameters(
+    {
+      fileSystemName: containerName,
+      pathName: directoryPath,
+      isDirectory: true,
+      permissions: FileSystemSASPermissions.parse("rl"),
+      startsOn,
+      expiresOn,
+      protocol: SASProtocol.Https
+    },
+    userDelegationKey,
+    accountName
+  ).toString();
+  
+  return sasQueryParameters.toString();
+}
+
+async function getAzureVmLocation(): Promise<string | undefined> {
+  try {
+    // Query Azure Instance Metadata Service (IMDS) to get VM compute metadata
+    const response = await fetch('http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01', {
+      headers: {
+        'Metadata': 'true'
+      },
+    });
+    
+    if (response.ok) {
+      const computeData = await response.json();
+      const location = computeData.location;
+      core.debug(`Azure VM location detected: ${location}`);
+      return location.toLowerCase();
+    }
+  } catch (error) {
+    core.debug(`Failed to query Azure IMDS: ${error}`);
+  }
+  return undefined;
+}
+
+async function getBlobMountParts(
+  originalUrl: string,
+): Promise<BlobUrlParts> {
+  const vmLocation = await getAzureVmLocation();
+  if (!vmLocation) {
+    throw new Error('VM location not detected');
+  }
+
+  // Find storage account that ends with VM location (pick shortest prefix after stripping location suffix)
+  // This is to handle cases where we have foocentralus, foonorthcentralus and foosouthcentralus
+  const additionalStorageAccounts = process.env.ADDITIONAL_STORAGE_ACCOUNTS ?? '';
+  let selectedStorageAccount: string | undefined;
+  let shortestPrefixLength = Infinity;
+  
+  const storageAccountNames: string[] = additionalStorageAccounts.split(',');
+  for (const storageAccount of storageAccountNames) {
+    if (storageAccount.endsWith(vmLocation)) {
+      const prefix = storageAccount.slice(0, -vmLocation.length);
+      if (prefix.length < shortestPrefixLength) {
+        shortestPrefixLength = prefix.length;
+        selectedStorageAccount = storageAccount;
+      }
+    }
+  }
+
+  if (!selectedStorageAccount) {
+    throw new Error(`No storage account found in ${vmLocation}`);
+  }
+
+  core.debug(`Using storage account: ${selectedStorageAccount}`);
+
+  // Extract blob name from original URL
+  const urlPath = new URL(originalUrl).pathname;
+  const fileName = urlPath.split('/').pop() ?? '';
+  const sas = await generateDataLakeSas(
+    selectedStorageAccount,
+    'actions-cache',
+    fileName
+  )
+
+  return {
+    accountName: selectedStorageAccount,
+    containerName: 'actions-cache',
+    blobDir: fileName,
+    sasToken: sas
+  };
 }

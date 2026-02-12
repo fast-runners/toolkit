@@ -49,6 +49,7 @@
     "node-fetch": "^3.3.2"
   },
   "dependencies": {
-    "@azure/identity": "^4.13.0"
+    "@azure/identity": "^4.13.0",
+    "@azure/storage-file-datalake": "^12.29.0"
   }
 }
