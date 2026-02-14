@@ -197,17 +197,52 @@ function changeExtension(filePath: string, newExt: string): string {
   return path.join(dir, `${name}${ext}`)
 }
 
+export function getBlockSize(): string {
+  const value = process.env['CACHE_BLOCK_SIZE']
+  if (!value) {
+    return '131072' // 128Kb
+  }
+  return value
+}
+
+export function getFuseBlockSize(): string {
+  const value = process.env['FUSE_BLOCK_SIZE']
+  if (!value) {
+    return '16' // 16Mb
+  }
+  return value
+}
+
+export function getCompression(): string {
+  const value = process.env['SQUASHFS_COMP']
+  if (!value) {
+    return 'zstd'
+  }
+  return value
+}
+
+export function getDisableFileCache(): boolean {
+  const value = process.env['FUSE_NO_FILE_CACHE']
+  if (value) {
+    return true
+  }
+  return false
+}
+
+
 export async function tar2SquashFS(archivePath: string): Promise<string> {
   const imagePath = changeExtension(archivePath, CacheFormat.SquashFS)
-  // We might consider using lz4 for the parity with EROFS
-  await exec.exec(`sh -c "zcat ${archivePath} | sqfstar -comp zstd -b 1M ${imagePath}"`)
+  const blockSize = getBlockSize()
+  const comp = getCompression()
+  await exec.exec(`sh -c "zcat ${archivePath} | sqfstar -comp ${comp} -b ${blockSize} ${imagePath}"`)
   return imagePath
 }
 
 export async function tar2EROFS(archivePath: string): Promise<string> {
   const imagePath = changeExtension(archivePath, CacheFormat.EROFS)
-  // Ubuntu24 images have mkfs.erofs compiled without zstd support hence lz4 
-  await exec.exec(`mkfs.erofs -z lz4 --tar=f --gzip ${imagePath} ${archivePath}`)
+  const blockSize = getBlockSize()
+  // Ubuntu24 images have mkfs.erofs compiled without zstd support hence lzma
+  await exec.exec(`mkfs.erofs -z lz4hc -C ${blockSize} --tar=f --gzip ${imagePath} ${archivePath}`)
   return imagePath
 }
 
@@ -242,7 +277,11 @@ export async function mountImage(archiveName: string, format: CacheFormat, blobf
   core.debug(`Mounting blobfuse to ${fuseDir}`)
   const configFile = path.join(parentDir, 'config.yml')
   fs.writeFileSync(configFile, blobfuseConfig);
-  await exec.exec(`sudo blobfuse2 mount ${fuseDir} --read-only --block-cache --block-cache-path ${tmpDir} --config-file ${configFile} --streaming`)
+  let fileCache = `--block-cache-path ${tmpDir}`
+  if (getDisableFileCache()) {
+    fileCache = ''
+  }
+  await exec.exec(`sudo blobfuse2 mount ${fuseDir} --read-only --block-cache ${fileCache} --config-file ${configFile} --streaming`)
 
   core.debug(`Mounting workspace to ${localDir}`)
   await exec.exec(`sudo mount --bind ${workspaceDir} ${localDir}`)
@@ -250,10 +289,11 @@ export async function mountImage(archiveName: string, format: CacheFormat, blobf
 
   core.debug(`Mounting cache to ${cacheDir}`)
   const archivePath = path.join(fuseDir, archiveName)
-  await exec.exec(`sudo mount -t ${format} -o loop,ro ${archivePath} ${cacheDir}`)
+  // threads=multu is a SquashFS option
+  await exec.exec(`sudo mount -t ${format} -o loop,ro,threads=multi ${archivePath} ${cacheDir}`)
 
   core.debug(`Mounting OverlayFS to ${mergeDir}`)
-  await exec.exec(`sudo mount -t overlay overlay -o lowerdir="${cacheDir}:${localDir}",upperdir=${writeDir},workdir=${workDir} ${mergeDir}`)
+  await exec.exec(`sudo mount -t overlay overlay -o lowerdir="${cacheDir}:${localDir}",upperdir=${writeDir},workdir=${workDir},volatile ${mergeDir}`)
 
   core.debug(`Mounting ${mergeDir} on top of workspace`)
   await exec.exec(`sudo mount --bind ${mergeDir} "${workspaceDir}`)
@@ -301,13 +341,31 @@ function parseBlobUrlWithSas(url: string): BlobUrlParts {
   };
 }
 
+function getLogLevel(): string {
+  const value = process.env['FUSE_LOG_LEVEL']
+  if (!value) {
+    return 'log_info'
+  }
+  return value
+}
+
 export async function generateBlobfuse2Config(blobUrl: string): Promise<string> {
   const { accountName, containerName, blobDir, sasToken } = await getBlobMountParts(blobUrl);
+  const blockSize = getFuseBlockSize()
+  const logLevel = getLogLevel()
     
   const config = {
+    logging: {
+      'type' : 'base',
+      'level': `${logLevel}`  
+    },
     block_cache: {
+      'block-size-mb': blockSize,
       'prefetch-on-open': true,
-      'disk-timeout-sec': 21600 
+      'disk-timeout-sec': 21600
+    },
+    attr_cache: {
+      'timeout-sec': 21600
     },
     azstorage: {
       'type': 'adls',
