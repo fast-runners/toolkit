@@ -293,7 +293,7 @@ export async function mountImage(archiveName: string, format: CacheFormat, blobf
   await exec.exec(`sudo mount -t ${format} -o loop,ro,threads=multi ${archivePath} ${cacheDir}`)
 
   core.debug(`Mounting OverlayFS to ${mergeDir}`)
-  await exec.exec(`sudo mount -t overlay overlay -o lowerdir="${cacheDir}:${localDir}",upperdir=${writeDir},workdir=${workDir},volatile ${mergeDir}`)
+  await exec.exec(`sudo mount -t overlay overlay -o lowerdir="${cacheDir}:${localDir}",upperdir=${writeDir},workdir=${workDir},metacopy=on,volatile ${mergeDir}`)
 
   core.debug(`Mounting ${mergeDir} on top of workspace`)
   await exec.exec(`sudo mount --bind ${mergeDir} "${workspaceDir}`)
